@@ -1,0 +1,366 @@
+<?php
+/**
+ * Rentisha RMS — Caretaker: Maintenance Expenses
+ * Caretaker can view and report money spent on repairs, materials, labour etc.
+ */
+session_start();
+require_once '../includes/auth_check.php';
+require_once '../includes/db_helpers.php';
+requireRole('caretaker');
+
+$pageTitle  = 'Maintenance Expenses';
+$activePage = 'expenses';
+
+$aptId   = (int)($_SESSION['apartment_id'] ?? 0);
+$aptName = $_SESSION['apartment'] ?? '';
+if (!$aptId) { header('Location: dashboard.php'); exit; }
+
+$pdo = getDB();
+
+$filterYear  = (int)($_GET['year']  ?? date('Y'));
+$filterMonth = trim($_GET['month'] ?? '');
+$filterType  = trim($_GET['type']  ?? '');
+
+$allMonths    = ['January','February','March','April','May','June',
+                 'July','August','September','October','November','December'];
+$expenseTypes = ['Plumbing','Electrical','Structural','Appliances','Security',
+                 'Cleaning','Pest Control','Locks & Keys','Painting',
+                 'General Maintenance','Other'];
+$costCategories = ['Labour','Materials','Equipment','Contractor','Permit','Other'];
+
+$where      = ['se.apartment_id = ?'];
+$positional = [$aptId];
+
+if ($filterYear)  { $where[] = 'se.year = ?';         $positional[] = $filterYear; }
+if ($filterMonth) { $where[] = 'se.month = ?';        $positional[] = $filterMonth; }
+if ($filterType)  { $where[] = 'se.expense_type = ?'; $positional[] = $filterType; }
+
+$stmt = $pdo->prepare(
+    "SELECT se.*,
+            pb.full_name AS paid_by_name
+     FROM shared_expenses se
+     LEFT JOIN users pb ON pb.id = se.paid_by
+     WHERE " . implode(' AND ', $where) . "
+     ORDER BY COALESCE(se.expense_date, se.created_at) DESC"
+);
+$stmt->execute($positional);
+$expenses = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+$statStmt = $pdo->prepare(
+    "SELECT COALESCE(SUM(amount),0) AS total,
+            COALESCE(SUM(CASE WHEN status='Pending' THEN amount END),0) AS pending,
+            COUNT(*) AS records
+     FROM shared_expenses WHERE apartment_id=? AND year=?"
+);
+$statStmt->execute([$aptId, $filterYear]);
+$stats = $statStmt->fetch(PDO::FETCH_ASSOC);
+
+$success = $_GET['success'] ?? '';
+$error   = $_GET['error']   ?? '';
+
+$typeIcons = [
+    'Plumbing'=>'bi-droplet-fill','Electrical'=>'bi-lightning-fill',
+    'Structural'=>'bi-building','Appliances'=>'bi-tools','Security'=>'bi-shield-fill',
+    'Cleaning'=>'bi-stars','Pest Control'=>'bi-bug-fill','Locks & Keys'=>'bi-key-fill',
+    'Painting'=>'bi-brush-fill','General Maintenance'=>'bi-wrench-adjustable-circle-fill',
+    'Other'=>'bi-three-dots',
+];
+$statusClass = ['Paid'=>'badge-paid','Pending'=>'badge-pending','Cancelled'=>'badge-secondary'];
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Maintenance Expenses — Rentisha Caretaker</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+  <link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="rms-shell">
+  <div class="sidebar-overlay" id="sidebarOverlay"></div>
+  <?php include '../includes/sidebar_caretaker.php'; ?>
+
+  <div class="main-content" id="mainContent">
+    <?php include '../includes/topnav.php'; ?>
+    <div class="page-content">
+
+      <?php if ($success): ?>
+      <div class="alert alert-success mb-4"><i class="bi bi-check-circle-fill"></i><div><?= htmlspecialchars($success) ?></div></div>
+      <?php endif; ?>
+      <?php if ($error): ?>
+      <div class="alert alert-danger mb-4"><i class="bi bi-exclamation-circle-fill"></i><div><?= htmlspecialchars($error) ?></div></div>
+      <?php endif; ?>
+
+      <div class="page-header">
+        <div>
+          <h1><i class="bi bi-wrench-adjustable-circle"></i> Maintenance Expenses</h1>
+          <p><?= htmlspecialchars($aptName) ?> — money spent on repairs, materials &amp; labour</p>
+        </div>
+        <button class="btn btn-primary" data-modal-open="addExpenseModal">
+          <i class="bi bi-plus-lg"></i> Report Expense
+        </button>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-grid" style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr));margin-bottom:20px;">
+        <div class="stat-card red">
+          <div class="stat-icon"><i class="bi bi-cash-coin"></i></div>
+          <div class="stat-value" style="font-size:1rem;"><?= formatKES($stats['total'] ?? 0) ?></div>
+          <div class="stat-label">Total Spent <?= $filterYear ?></div>
+        </div>
+        <div class="stat-card orange">
+          <div class="stat-icon"><i class="bi bi-hourglass-split"></i></div>
+          <div class="stat-value" style="font-size:1rem;"><?= formatKES($stats['pending'] ?? 0) ?></div>
+          <div class="stat-label">Awaiting Approval</div>
+        </div>
+        <div class="stat-card blue">
+          <div class="stat-icon"><i class="bi bi-receipt"></i></div>
+          <div class="stat-value" data-count="<?= $stats['records'] ?? 0 ?>"><?= $stats['records'] ?? 0 ?></div>
+          <div class="stat-label">Records <?= $filterYear ?></div>
+        </div>
+      </div>
+
+      <!-- Filters -->
+      <div class="filter-bar">
+        <div class="input-group search-box">
+          <i class="bi bi-search input-icon"></i>
+          <input type="search" class="form-control" placeholder="Search description, vendor…" data-search-table="expTable">
+        </div>
+        <form method="GET" style="display:contents;">
+          <select name="type" class="form-control" style="width:auto;" onchange="this.form.submit()">
+            <option value="">All Types</option>
+            <?php foreach ($expenseTypes as $t): ?>
+            <option value="<?= $t ?>" <?= $filterType===$t?'selected':'' ?>><?= $t ?></option>
+            <?php endforeach; ?>
+          </select>
+          <select name="month" class="form-control" style="width:auto;" onchange="this.form.submit()">
+            <option value="">All Months</option>
+            <?php foreach ($allMonths as $m): ?>
+            <option value="<?= $m ?>" <?= $filterMonth===$m?'selected':'' ?>><?= $m ?></option>
+            <?php endforeach; ?>
+          </select>
+          <select name="year" class="form-control" style="width:80px;" onchange="this.form.submit()">
+            <?php for ($y=(int)date('Y'); $y>=(int)date('Y')-2; $y--): ?>
+            <option value="<?= $y ?>" <?= $filterYear===$y?'selected':'' ?>><?= $y ?></option>
+            <?php endfor; ?>
+          </select>
+        </form>
+      </div>
+
+      <!-- Table -->
+      <div class="card">
+        <div class="card-body p-0">
+          <div class="table-wrapper">
+            <table class="rms-table" id="expTable">
+              <thead>
+                <tr>
+                  <th>Date</th><th>Type</th><th>What Was Done</th>
+                  <th>Category</th><th>Vendor</th><th>Amount</th>
+                  <th>Receipt #</th><th>Status</th><th class="col-actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php if (empty($expenses)): ?>
+                <tr>
+                  <td colspan="9" style="text-align:center;padding:40px;color:var(--text-muted);">
+                    <i class="bi bi-wrench" style="font-size:2.5rem;display:block;margin-bottom:8px;"></i>
+                    No expenses reported<?= $filterMonth ? ' for '.$filterMonth.' '.$filterYear : '' ?>.
+                    <br><a href="#" data-modal-open="addExpenseModal">Report one now</a>.
+                  </td>
+                </tr>
+                <?php else: ?>
+                  <?php
+                  $total = 0;
+                  foreach ($expenses as $e):
+                    $total += (float)$e['amount'];
+                    $icon = $typeIcons[$e['expense_type']] ?? 'bi-tools';
+                  ?>
+                  <tr>
+                    <td style="font-size:.82rem;white-space:nowrap;">
+                      <?= $e['expense_date'] ? formatDate($e['expense_date']) : ($e['month'].' '.$e['year']) ?>
+                    </td>
+                    <td>
+                      <span style="display:flex;align-items:center;gap:5px;font-size:.83rem;font-weight:600;">
+                        <i class="bi <?= $icon ?>" style="color:var(--primary);"></i>
+                        <?= htmlspecialchars($e['expense_type']) ?>
+                      </span>
+                    </td>
+                    <td style="max-width:200px;"><?= htmlspecialchars($e['description'] ?? '—') ?></td>
+                    <td><span class="badge badge-info" style="font-size:.72rem;"><?= htmlspecialchars($e['cost_category'] ?? 'Other') ?></span></td>
+                    <td style="font-size:.82rem;"><?= htmlspecialchars($e['vendor'] ?? '—') ?></td>
+                    <td class="fw-bold" style="color:var(--danger);"><?= formatKES($e['amount']) ?></td>
+                    <td>
+                      <?php if ($e['receipt_ref']): ?>
+                      <code style="font-size:.72rem;"><?= htmlspecialchars($e['receipt_ref']) ?></code>
+                      <?php else: ?>
+                      <span style="color:var(--text-muted);font-size:.75rem;">—</span>
+                      <?php endif; ?>
+                    </td>
+                    <td><span class="badge <?= $statusClass[$e['status']] ?? 'badge-secondary' ?>"><?= $e['status'] ?></span></td>
+                    <td class="col-actions">
+                      <div class="d-flex gap-1" style="justify-content:flex-end;">
+                        <button type="button" class="btn btn-outline btn-sm btn-icon" title="Edit"
+                          onclick="openEditExpense(<?= htmlspecialchars(json_encode($e)) ?>)">
+                          <i class="bi bi-pencil"></i>
+                        </button>
+                        <form method="POST" action="../includes/save_expense.php" style="display:inline;"
+                              onsubmit="return confirm('Delete this expense record?')">
+                          <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(rmsCsrfToken()) ?>">
+                          <input type="hidden" name="delete_id" value="<?= $e['id'] ?>">
+                          <button type="submit" class="btn btn-danger btn-sm btn-icon" title="Delete">
+                            <i class="bi bi-trash"></i>
+                          </button>
+                        </form>
+                      </div>
+                    </td>
+                  </tr>
+                  <?php endforeach; ?>
+                  <tr style="background:var(--bg-secondary);font-weight:700;">
+                    <td colspan="5" style="text-align:right;padding:10px 12px;">TOTAL</td>
+                    <td style="color:var(--danger);"><?= formatKES($total) ?></td>
+                    <td colspan="3"></td>
+                  </tr>
+                <?php endif; ?>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ REPORT EXPENSE MODAL ═══════ -->
+<div class="modal-overlay" id="addExpenseModal">
+  <div class="modal modal-lg">
+    <div class="modal-header">
+      <h3 id="expModalTitle"><i class="bi bi-wrench-adjustable"></i> Report Maintenance Expense</h3>
+      <button class="modal-close" data-modal-close><i class="bi bi-x-lg"></i></button>
+    </div>
+    <div class="modal-body">
+      <div class="alert alert-info" style="font-size:.83rem;">
+        <i class="bi bi-info-circle-fill"></i>
+        <div>Report money you spent on maintenance. The admin will be notified automatically.</div>
+      </div>
+      <form action="../includes/save_expense.php" method="POST" data-validate id="expenseForm">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(rmsCsrfToken()) ?>">
+        <input type="hidden" name="edit_id"      id="expEditId"    value="">
+        <input type="hidden" name="apartment_id" value="<?= $aptId ?>">
+        <input type="hidden" name="paid_by"      value="<?= (int)$_SESSION['user_id'] ?>">
+        <input type="hidden" name="status"       value="Paid">
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Expense Type <span class="required">*</span></label>
+            <select name="expense_type" id="expType" class="form-control" required>
+              <option value="">— Select —</option>
+              <?php foreach ($expenseTypes as $t): ?>
+              <option value="<?= $t ?>"><?= $t ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Cost Category <span class="required">*</span></label>
+            <select name="cost_category" id="expCostCat" class="form-control" required>
+              <?php foreach ($costCategories as $c): ?>
+              <option value="<?= $c ?>"><?= $c ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">What Was Done <span class="required">*</span></label>
+          <textarea name="description" id="expDesc" class="form-control" rows="2" required
+            placeholder="e.g. Replaced broken lock on unit 7 — bought 1 deadbolt from Kariuki Hardware"></textarea>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Amount Spent (KES) <span class="required">*</span></label>
+            <div class="input-group">
+              <i class="bi bi-currency-exchange input-icon"></i>
+              <input type="number" name="amount" id="expAmount" class="form-control"
+                     placeholder="e.g. 3500" required min="1" step="0.01">
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Date Spent <span class="required">*</span></label>
+            <input type="date" name="expense_date" id="expDate" class="form-control"
+                   value="<?= date('Y-m-d') ?>" required>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Vendor / Technician</label>
+            <input type="text" name="vendor" id="expVendor" class="form-control"
+              placeholder="e.g. Kariuki Hardware, John the Plumber">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Receipt / Invoice #</label>
+            <input type="text" name="receipt_ref" id="expReceipt" class="form-control"
+              placeholder="e.g. RCP-00123">
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Month</label>
+            <select name="month" id="expMonth" class="form-control">
+              <?php foreach ($allMonths as $m): ?>
+              <option value="<?= $m ?>" <?= $m===date('F')?'selected':'' ?>><?= $m ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Year</label>
+            <select name="year" id="expYear" class="form-control">
+              <?php for ($y=(int)date('Y'); $y>=(int)date('Y')-1; $y--): ?>
+              <option value="<?= $y ?>" <?= $y===(int)date('Y')?'selected':'' ?>><?= $y ?></option>
+              <?php endfor; ?>
+            </select>
+          </div>
+        </div>
+
+        <div class="modal-footer" style="padding:0;margin-top:8px;">
+          <button type="button" class="btn btn-outline" data-modal-close>Cancel</button>
+          <button type="submit" class="btn btn-primary" id="expSubmitBtn">
+            <i class="bi bi-send-fill"></i> Report to Admin
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script src="../assets/js/main.js"></script>
+<script>
+function openEditExpense(e) {
+  document.getElementById('expModalTitle').innerHTML = '<i class="bi bi-pencil-square"></i> Edit Expense';
+  document.getElementById('expSubmitBtn').innerHTML  = '<i class="bi bi-check-lg"></i> Update';
+  document.getElementById('expEditId').value   = e.id;
+  document.getElementById('expType').value     = e.expense_type   || '';
+  document.getElementById('expCostCat').value  = e.cost_category  || 'Other';
+  document.getElementById('expDesc').value     = e.description    || '';
+  document.getElementById('expAmount').value   = e.amount         || '';
+  document.getElementById('expDate').value     = e.expense_date   || '';
+  document.getElementById('expVendor').value   = e.vendor         || '';
+  document.getElementById('expReceipt').value  = e.receipt_ref    || '';
+  document.getElementById('expMonth').value    = e.month          || '';
+  document.getElementById('expYear').value     = e.year           || '';
+  openModal('addExpenseModal');
+}
+
+document.querySelector('[data-modal-open="addExpenseModal"]')?.addEventListener('click', function() {
+  document.getElementById('expenseForm').reset();
+  document.getElementById('expEditId').value  = '';
+  document.getElementById('expDate').value    = '<?= date('Y-m-d') ?>';
+  document.getElementById('expModalTitle').innerHTML = '<i class="bi bi-wrench-adjustable"></i> Report Maintenance Expense';
+  document.getElementById('expSubmitBtn').innerHTML  = '<i class="bi bi-send-fill"></i> Report to Admin';
+});
+</script>
+</body>
+</html>
